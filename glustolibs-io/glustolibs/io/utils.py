@@ -1,4 +1,4 @@
-#  Copyright (C) 2015-2016  Red Hat, Inc. <http://www.redhat.com>
+#  Copyright (C) 2015-2020  Red Hat, Inc. <http://www.redhat.com>
 #
 #  This program is free software; you can redistribute it and/or modify
 #  it under the terms of the GNU General Public License as published by
@@ -22,17 +22,21 @@ import os
 import subprocess
 
 from glusto.core import Glusto as g
+from glustolibs.gluster.glusterfile import file_exists
 from glustolibs.gluster.mount_ops import GlusterMount
 from glustolibs.gluster.volume_libs import get_subvols
 from glustolibs.misc.misc_libs import upload_scripts
 
 
-def collect_mounts_arequal(mounts):
+def collect_mounts_arequal(mounts, path=''):
     """Collects arequal from all the mounts
 
     Args:
         mounts (list): List of all GlusterMount objs.
 
+    Kwargs:
+        path (str): Path whose arequal is to be calculated.
+                    Defaults to root of mountpoint
     Returns:
         tuple(bool, list):
             On success returns (True, list of arequal-checksums of each mount)
@@ -47,9 +51,10 @@ def collect_mounts_arequal(mounts):
     g.log.info("Start collecting arequal-checksum from all mounts")
     all_mounts_procs = []
     for mount_obj in mounts:
+        total_path = os.path.join(mount_obj.mountpoint, path)
         g.log.info("arequal-checksum of mount %s:%s", mount_obj.client_system,
-                   mount_obj.mountpoint)
-        cmd = "arequal-checksum -p %s -i .trashcan" % mount_obj.mountpoint
+                   total_path)
+        cmd = "arequal-checksum -p %s -i .trashcan" % total_path
         proc = g.run_async(mount_obj.client_system, cmd, user=mount_obj.user)
         all_mounts_procs.append(proc)
     all_mounts_arequal_checksums = []
@@ -983,3 +988,84 @@ def upload_file_dir_ops(clients):
     g.log.info("Successfully uploaded IO scripts to clients %s",
                clients)
     return True
+
+
+def open_file_fd(mountpoint, time, client, start_range=0,
+                 end_range=0):
+    """Open FD for a file and write to file.
+
+    Args:
+      mountpoint(str): The mount point where the FD of file is to
+                       be opened.
+      time(int): The time to wait after opening an FD.
+      client(str): The client from which FD is to be opened.
+
+    Kwargs:
+        start_range(int): The start range of the open FD.
+                          (Default: 0)
+        end_range(int): The end range of the open FD.
+                        (Default: 0)
+
+    Returns:
+      proc(object): Returns a process object
+
+    NOTE:
+    Before opening FD, check the currently used fds on the
+    system as only a limited number of fds can be opened on
+    a system at a given time for each process.
+    """
+    if not (start_range and end_range):
+        cmd = ("cd {}; exec 30<> file_openfd ; sleep {};"
+               "echo 'xyz' >&30".format(mountpoint, time))
+    else:
+        cmd = ('cd {}; for i in `seq {} {}`;'
+               ' do eval "exec $i<>file_openfd$i"; sleep {};'
+               ' echo "Write to open FD" >&$i; done'.format(
+                   mountpoint, start_range, end_range, time))
+    proc = g.run_async(client, cmd)
+    return proc
+
+
+def run_linux_untar(clients, mountpoint, dirs=('.')):
+    """Run linux kernal untar on a given mount point
+
+    Args:
+      clients(str|list): Client nodes on which I/O
+                         has to be started.
+      mountpoint(str): Mount point where the volume is
+                       mounted.
+    Kwagrs:
+       dirs(tuple): A tuple of dirs where untar has to
+                    started. (Default:('.'))
+    Returns:
+       list: Returns a list of process object else None
+    """
+    # Checking and convering clients to list.
+    if not isinstance(clients, list):
+        clients = [clients]
+
+    list_of_procs = []
+    for client in clients:
+        # Download linux untar to root, so that it can be
+        # utilized in subsequent run_linux_untar() calls.
+        cmd = ("wget https://cdn.kernel.org/pub/linux/kernel/"
+               "v5.x/linux-5.4.54.tar.xz")
+        if not file_exists(client, '/root/linux-5.4.54.tar.xz'):
+            ret, _, _ = g.run(client, cmd)
+            if ret:
+                return None
+
+        for directory in dirs:
+            # copy linux tar to dir
+            cmd = ("cp /root/linux-5.4.54.tar.xz {}/{}"
+                   .format(mountpoint, directory))
+            ret, _, _ = g.run(client, cmd)
+            if ret:
+                return None
+            # Start linux untar
+            cmd = ("cd {}/{};tar -xvf linux-5.4.54.tar.xz"
+                   .format(mountpoint, directory))
+            proc = g.run_async(client, cmd)
+            list_of_procs.append(proc)
+
+    return list_of_procs

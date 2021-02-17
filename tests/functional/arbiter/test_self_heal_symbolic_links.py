@@ -169,10 +169,7 @@ class TestSelfHeal(GlusterBaseClass):
         # Select bricks to bring offline
         bricks_to_bring_offline_dict = (select_bricks_to_bring_offline(
             self.mnode, self.volname))
-        bricks_to_bring_offline = list(filter(None, (
-            bricks_to_bring_offline_dict['hot_tier_bricks'] +
-            bricks_to_bring_offline_dict['cold_tier_bricks'] +
-            bricks_to_bring_offline_dict['volume_bricks'])))
+        bricks_to_bring_offline = bricks_to_bring_offline_dict['volume_bricks']
 
         # Bring brick offline
         g.log.info('Bringing bricks %s offline...', bricks_to_bring_offline)
@@ -196,9 +193,10 @@ class TestSelfHeal(GlusterBaseClass):
 
         # Checking arequals before bringing bricks offline
         # and after bringing bricks offline
-        self.assertItemsEqual(result_before_offline, result_after_offline,
-                              'Checksums before and '
-                              'after bringing bricks online are not equal')
+        self.assertEqual(sorted(result_before_offline),
+                         sorted(result_after_offline),
+                         'Checksums before and after bringing bricks '
+                         'online are not equal')
         g.log.info('Checksums before and after bringing bricks online '
                    'are equal')
 
@@ -323,8 +321,9 @@ class TestSelfHeal(GlusterBaseClass):
 
         # Checking arequals before bringing bricks online
         # and after bringing bricks online
-        self.assertItemsEqual(result_before_online, result_after_online,
-                              'Checksums before and '
-                              'after bringing bricks online are not equal')
+        self.assertEqual(sorted(result_before_online),
+                         sorted(result_after_online),
+                         'Checksums before and after bringing bricks '
+                         'online are not equal')
         g.log.info('Checksums before and after bringing bricks online '
                    'are equal')

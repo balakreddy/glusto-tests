@@ -131,8 +131,8 @@ class RebalanceValidation(GlusterBaseClass):
         # Log Volume Info and Status before expanding the volume.
         g.log.info("Logging volume info and Status before expanding volume")
         ret = log_volume_info_and_status(self.mnode, self.volname)
-        g.log.error(ret, "Logging volume info and status failed on "
-                         "volume %s", self.volname)
+        self.assertTrue(ret, ("Logging volume info and status failed on "
+                              "volume %s", self.volname))
         g.log.info("Logging volume info and status was successful for volume "
                    "%s", self.volname)
 
@@ -208,14 +208,14 @@ class RebalanceValidation(GlusterBaseClass):
                                           self.volname))
         g.log.info("Volume %s state is \"Started\"", self.volname)
 
-    @classmethod
-    def tearDownClass(cls):
-        # Unmount Volume and Cleanup Volume
-        g.log.info("Starting to Unmount Volume and Cleanup Volume")
-        ret = cls.unmount_volume_and_cleanup_volume(mounts=cls.mounts)
-        if not ret:
-            raise ExecutionError("Failed to Unmount Volume and Cleanup Volume")
-        g.log.info("Volume %s unmount and cleanup: Success", cls.volname)
+    def tearDown(self):
 
-        # Calling GlusterBaseClass tearDownClass
-        cls.get_super_method(cls, 'tearDownClass')()
+        # Unmount and cleanup original volume
+        g.log.info("Starting to Unmount Volume and Cleanup Volume")
+        ret = self.unmount_volume_and_cleanup_volume(mounts=self.mounts)
+        if not ret:
+            raise ExecutionError("Failed to umount the vol & cleanup Volume")
+        g.log.info("Successful in umounting the volume and Cleanup")
+
+        # Calling GlusterBaseClass tearDown
+        self.get_super_method(self, 'tearDown')()

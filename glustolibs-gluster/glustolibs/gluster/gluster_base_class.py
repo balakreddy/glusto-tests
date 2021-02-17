@@ -1,4 +1,4 @@
-#  Copyright (C) 2018-2020 Red Hat, Inc. <http://www.redhat.com>
+#  Copyright (C) 2018-2021 Red Hat, Inc. <http://www.redhat.com>
 #
 #  This program is free software; you can redistribute it and/or modify
 #  it under the terms of the GNU General Public License as published by
@@ -29,6 +29,7 @@ from socket import (
     gaierror,
 )
 from unittest import TestCase
+from time import sleep
 
 from glusto.core import Glusto as g
 
@@ -41,9 +42,12 @@ from glustolibs.gluster.mount_ops import create_mount_objs
 from glustolibs.gluster.nfs_libs import export_volume_through_nfs
 from glustolibs.gluster.peer_ops import (
     is_peer_connected,
-    peer_status,
+    peer_probe_servers, peer_status
 )
+from glustolibs.gluster.gluster_init import (
+    restart_glusterd, stop_glusterd, wait_for_glusterd_to_start)
 from glustolibs.gluster.samba_libs import share_volume_over_smb
+from glustolibs.gluster.shared_storage_ops import is_shared_volume_mounted
 from glustolibs.gluster.volume_libs import (
     cleanup_volume,
     log_volume_info_and_status,
@@ -56,6 +60,9 @@ from glustolibs.gluster.volume_ops import (
     set_volume_options, volume_reset, volume_start)
 from glustolibs.io.utils import log_mounts_info
 from glustolibs.gluster.geo_rep_libs import setup_master_and_slave_volumes
+from glustolibs.gluster.nfs_ganesha_ops import (
+    teardown_nfs_ganesha_cluster)
+from glustolibs.misc.misc_libs import kill_process
 
 
 class runs_on(g.CarteTestClass):
@@ -99,6 +106,7 @@ class GlusterBaseClass(TestCase):
     # defaults in setUpClass()
     volume_type = None
     mount_type = None
+    error_or_failure_exists = False
 
     @staticmethod
     def get_super_method(obj, method_name):
@@ -188,6 +196,11 @@ class GlusterBaseClass(TestCase):
         Returns (bool): True if all peers are in connected with other peers.
             False otherwise.
         """
+
+        # If the setup has single node server, by pass this validation.
+        if len(cls.servers) == 1:
+            return True
+
         # Validate if peer is connected from all the servers
         g.log.info("Validating if servers %s are connected from other servers "
                    "in the cluster", cls.servers)
@@ -210,11 +223,121 @@ class GlusterBaseClass(TestCase):
 
         return True
 
+    def _is_error_or_failure_exists(self):
+        """Function to get execution error in case of
+        failures in testcases
+        """
+        if hasattr(self, '_outcome'):
+            # Python 3.4+
+            result = self.defaultTestResult()
+            self._feedErrorsToResult(result, self._outcome.errors)
+        else:
+            # Python 2.7-3.3
+            result = getattr(
+                self, '_outcomeForDoCleanups', self._resultForDoCleanups)
+        ok_result = True
+        for attr in ('errors', 'failures'):
+            if not hasattr(result, attr):
+                continue
+            exc_list = getattr(result, attr)
+            if exc_list and exc_list[-1][0] is self:
+                ok_result = ok_result and not exc_list[-1][1]
+        if hasattr(result, '_excinfo'):
+            ok_result = ok_result and not result._excinfo
+        if ok_result:
+            return False
+        self.error_or_failure_exists = True
+        GlusterBaseClass.error_or_failure_exists = True
+        return True
+
     @classmethod
-    def setup_volume(cls, volume_create_force=False):
+    def scratch_cleanup(cls, error_or_failure_exists):
+        """
+        This scratch_cleanup script will run only when the code
+        currently running goes into execution or assertion error.
+
+        Args:
+            error_or_failure_exists (bool): If set True will cleanup setup
+                atlast of testcase only if exectution or assertion error in
+                teststeps. False will skip this scratch cleanup step.
+
+        Returns (bool): True if setup cleanup is successful.
+            False otherwise.
+        """
+        if error_or_failure_exists:
+            shared_storage_mounted = False
+            if is_shared_volume_mounted(cls.mnode):
+                shared_storage_mounted = True
+            ret = stop_glusterd(cls.servers)
+            if not ret:
+                g.log.error("Failed to stop glusterd")
+                cmd_list = ("pkill `pidof glusterd`",
+                            "rm /var/run/glusterd.socket")
+                for server in cls.servers:
+                    for cmd in cmd_list:
+                        ret, _, _ = g.run(server, cmd, "root")
+                        if ret:
+                            g.log.error("Failed to stop glusterd")
+                            return False
+            for server in cls.servers:
+                ret, out, _ = g.run(server, "pgrep glusterfsd", "root")
+                if not ret:
+                    ret = kill_process(server,
+                                       process_ids=out.strip().split('\n'))
+                    if not ret:
+                        g.log.error("Unable to kill process {}".format(
+                            out.strip().split('\n')))
+                        return False
+                if not shared_storage_mounted:
+                    cmd_list = (
+                        "rm -rf /var/lib/glusterd/vols/*",
+                        "rm -rf /var/lib/glusterd/snaps/*",
+                        "rm -rf /var/lib/glusterd/peers/*",
+                        "rm -rf {}/*/*".format(
+                            cls.all_servers_info[server]['brick_root']))
+                else:
+                    cmd_list = (
+                        "for vol in `ls /var/lib/glusterd/vols/ | "
+                        "grep -v gluster_shared_storage`;do "
+                        "rm -rf /var/lib/glusterd/vols/$vol;done",
+                        "rm -rf /var/lib/glusterd/snaps/*"
+                        "rm -rf {}/*/*".format(
+                            cls.all_servers_info[server]['brick_root']))
+                for cmd in cmd_list:
+                    ret, _, _ = g.run(server, cmd, "root")
+                    if ret:
+                        g.log.error(
+                            "failed to cleanup server {}".format(server))
+                        return False
+            ret = restart_glusterd(cls.servers)
+            if not ret:
+                g.log.error("Failed to start glusterd")
+                return False
+            sleep(2)
+            ret = wait_for_glusterd_to_start(cls.servers)
+            if not ret:
+                g.log.error("Failed to bring glusterd up")
+                return False
+            if not shared_storage_mounted:
+                ret = peer_probe_servers(cls.mnode, cls.servers)
+                if not ret:
+                    g.log.error("Failed to peer probe servers")
+                    return False
+            for client in cls.clients:
+                cmd_list = ("umount /mnt/*", "rm -rf /mnt/*")
+                for cmd in cmd_list:
+                    ret = g.run(client, cmd, "root")
+                    if ret:
+                        g.log.error(
+                            "failed to unmount/already unmounted {}"
+                            .format(client))
+            return True
+
+    @classmethod
+    def setup_volume(cls, volume_create_force=False, only_volume_create=False):
         """Setup the volume:
             - Create the volume, Start volume, Set volume
-            options, enable snapshot/quota/tier if specified in the config
+            options, enable snapshot/quota if specified in the config
             file.
             - Wait for volume processes to be online
             - Export volume as NFS/SMB share if mount_type is NFS or SMB
@@ -223,6 +346,9 @@ class GlusterBaseClass(TestCase):
         Args:
             volume_create_force(bool): True if create_volume should be
                 executed with 'force' option.
+            only_volume_create(bool): True, only volume creation is needed
+                                      False, by default volume creation and
+                                      start.
 
         Returns (bool): True if all the steps mentioned in the descriptions
             passes. False otherwise.
@@ -245,11 +371,18 @@ class GlusterBaseClass(TestCase):
         g.log.info("Setting up volume %s", cls.volname)
         ret = setup_volume(mnode=cls.mnode,
                            all_servers_info=cls.all_servers_info,
-                           volume_config=cls.volume, force=force_volume_create)
+                           volume_config=cls.volume, force=force_volume_create,
+                           create_only=only_volume_create)
         if not ret:
             g.log.error("Failed to Setup volume %s", cls.volname)
             return False
         g.log.info("Successful in setting up volume %s", cls.volname)
+
+        # Returning the value without proceeding for next steps
+        if only_volume_create and ret:
+            g.log.info("Setup volume with volume creation {} "
+                       "successful".format(cls.volname))
+            return True
 
         # Wait for volume processes to be online
         g.log.info("Wait for volume %s processes to be online", cls.volname)
@@ -341,6 +474,9 @@ class GlusterBaseClass(TestCase):
         """
         g.log.info("Starting to mount volume %s", cls.volname)
         for mount_obj in mounts:
+            # For nfs-ganesha, mount is done via vip
+            if cls.enable_nfs_ganesha:
+                mount_obj.server_system = cls.vips[0]
             g.log.info("Mounting volume '%s:%s' on '%s:%s'",
                        mount_obj.server_system, mount_obj.volname,
                        mount_obj.client_system, mount_obj.mountpoint)
@@ -860,8 +996,8 @@ class GlusterBaseClass(TestCase):
                     mount_dict['volname'] = cls.slave_volume
                     mount_dict['server'] = cls.mnode_slave
                     mount_dict['mountpoint'] = path_join(
-                            "/mnt", '_'.join([cls.slave_volname,
-                                              cls.mount_type]))
+                        "/mnt", '_'.join([cls.slave_volname,
+                                          cls.mount_type]))
                 cls.slave_mounts = create_mount_objs(slave_mount_dict_list)
 
             # Defining clients from mounts.
@@ -901,6 +1037,31 @@ class GlusterBaseClass(TestCase):
                 datetime.now().strftime('%H_%M_%d_%m_%Y'))
         cls.glustotest_run_id = g.config['glustotest_run_id']
 
+        if cls.enable_nfs_ganesha:
+            g.log.info("Setup NFS_Ganesha")
+            cls.num_of_nfs_ganesha_nodes = int(cls.num_of_nfs_ganesha_nodes)
+            cls.servers_in_nfs_ganesha_cluster = (
+                cls.servers[:cls.num_of_nfs_ganesha_nodes])
+            cls.vips_in_nfs_ganesha_cluster = (
+                cls.vips[:cls.num_of_nfs_ganesha_nodes])
+
+            # Obtain hostname of servers in ganesha cluster
+            cls.ganesha_servers_hostname = []
+            for ganesha_server in cls.servers_in_nfs_ganesha_cluster:
+                ret, hostname, _ = g.run(ganesha_server, "hostname")
+                if ret:
+                    raise ExecutionError("Failed to obtain hostname of %s"
+                                         % ganesha_server)
+                hostname = hostname.strip()
+                g.log.info("Obtained hostname: IP- %s, hostname- %s",
+                           ganesha_server, hostname)
+                cls.ganesha_servers_hostname.append(hostname)
+            from glustolibs.gluster.nfs_ganesha_libs import setup_nfs_ganesha
+            ret = setup_nfs_ganesha(cls)
+            if not ret:
+                raise ExecutionError("Failed to setup nfs ganesha")
+            g.log.info("Successful in setting up NFS Ganesha Cluster")
+
         msg = "Setupclass: %s : %s" % (cls.__name__, cls.glustotest_run_id)
         g.log.info(msg)
         cls.inject_msg_in_gluster_logs(msg)
@@ -923,3 +1084,264 @@ class GlusterBaseClass(TestCase):
         msg = "Teardownclass: %s : %s" % (cls.__name__, cls.glustotest_run_id)
         g.log.info(msg)
         cls.inject_msg_in_gluster_logs(msg)
+
+    def doCleanups(self):
+        if (self.error_or_failure_exists or
+                self._is_error_or_failure_exists()):
+            ret = self.scratch_cleanup(self.error_or_failure_exists)
+            g.log.info(ret)
+        return self.get_super_method(self, 'doCleanups')()
+
+    @classmethod
+    def doClassCleanups(cls):
+        if (GlusterBaseClass.error_or_failure_exists or
+                cls._is_error_or_failure_exists()):
+            ret = cls.scratch_cleanup(
+                GlusterBaseClass.error_or_failure_exists)
+            g.log.info(ret)
+        return cls.get_super_method(cls, 'doClassCleanups')()
+
+    @classmethod
+    def delete_nfs_ganesha_cluster(cls):
+        ret = teardown_nfs_ganesha_cluster(
+            cls.servers_in_nfs_ganesha_cluster)
+        if not ret:
+            g.log.error("Teardown got failed. Hence, cleaning up "
+                        "nfs-ganesha cluster forcefully")
+            ret = teardown_nfs_ganesha_cluster(
+                cls.servers_in_nfs_ganesha_cluster, force=True)
+            if not ret:
+                raise ExecutionError("Force cleanup of nfs-ganesha "
+                                     "cluster failed")
+        g.log.info("Teardown nfs ganesha cluster succeeded")
+
+    @classmethod
+    def start_memory_and_cpu_usage_logging(cls, test_id, interval=60,
+                                           count=100):
+        """Upload logger script and start logging usage on cluster
+
+        Args:
+         test_id(str): ID of the test running fetched from self.id()
+
+        Kawrgs:
+         interval(int): Time interval after which logs are to be collected
+                        (Default: 60)
+         count(int): Number of samples to be collected(Default: 100)
+
+        Returns:
+         proc_dict(dict):Dictionary of logging processes
+        """
+        # imports are added inside function to make it them
+        # optional and not cause breakage on installation
+        # which don't use the resource leak library
+        from glustolibs.io.memory_and_cpu_utils import (
+            check_upload_memory_and_cpu_logger_script,
+            log_memory_and_cpu_usage_on_cluster)
+
+        # Checking if script is present on servers or not if not then
+        # upload it to servers.
+        if not check_upload_memory_and_cpu_logger_script(cls.servers):
+            return None
+
+        # Checking if script is present on clients or not if not then
+        # upload it to clients.
+        if not check_upload_memory_and_cpu_logger_script(cls.clients):
+            return None
+
+        # Start logging on servers and clients
+        proc_dict = log_memory_and_cpu_usage_on_cluster(
+            cls.servers, cls.clients, test_id, interval, count)
+
+        return proc_dict
+
+    @classmethod
+    def compute_and_print_usage_stats(cls, test_id, proc_dict,
+                                      kill_proc=False):
+        """Compute and print CPU and memory usage statistics
+
+        Args:
+         proc_dict(dict):Dictionary of logging processes
+         test_id(str): ID of the test running fetched from self.id()
+
+        Kwargs:
+         kill_proc(bool): Kill logging process if true else wait
+                          for process to complete execution
+        """
+        # imports are added inside function to make it them
+        # optional and not cause breakage on installation
+        # which don't use the resource leak library
+        from glustolibs.io.memory_and_cpu_utils import (
+            wait_for_logging_processes_to_stop, kill_all_logging_processes,
+            compute_data_usage_stats_on_servers,
+            compute_data_usage_stats_on_clients)
+
+        # Wait or kill running logging process
+        if kill_proc:
+            nodes = cls.servers + cls.clients
+            ret = kill_all_logging_processes(proc_dict, nodes, cluster=True)
+            if not ret:
+                g.log.error("Unable to stop logging processes.")
+        else:
+            ret = wait_for_logging_processes_to_stop(proc_dict, cluster=True)
+            if not ret:
+                g.log.error("Processes didn't complete still running.")
+
+        # Compute and print stats for servers
+        ret = compute_data_usage_stats_on_servers(cls.servers, test_id)
+        g.log.info('*' * 50)
+        g.log.info(ret)  # TODO: Make logged message more structured
+        g.log.info('*' * 50)
+
+        # Compute and print stats for clients
+        ret = compute_data_usage_stats_on_clients(cls.clients, test_id)
+        g.log.info('*' * 50)
+        g.log.info(ret)  # TODO: Make logged message more structured
+        g.log.info('*' * 50)
+
+    @classmethod
+    def check_for_memory_leaks_and_oom_kills_on_servers(cls, test_id,
+                                                        gain=30.0):
+        """Check for memory leaks and OOM kills on servers
+
+        Args:
+         test_id(str): ID of the test running fetched from self.id()
+
+        Kwargs:
+         gain(float): Accepted amount of leak for a given testcase in MB
+                      (Default:30)
+
+        Returns:
+         bool: True if memory leaks or OOM kills are observed else false
+        """
+        # imports are added inside function to make it them
+        # optional and not cause breakage on installation
+        # which don't use the resource leak library
+        from glustolibs.io.memory_and_cpu_utils import (
+            check_for_memory_leaks_in_glusterd,
+            check_for_memory_leaks_in_glusterfs,
+            check_for_memory_leaks_in_glusterfsd,
+            check_for_oom_killers_on_servers)
+
+        # Check for memory leaks on glusterd
+        if check_for_memory_leaks_in_glusterd(cls.servers, test_id, gain):
+            g.log.error("Memory leak on glusterd.")
+            return True
+
+        if cls.volume_type != "distributed":
+            # Check for memory leaks on shd
+            if check_for_memory_leaks_in_glusterfs(cls.servers, test_id,
+                                                   gain):
+                g.log.error("Memory leak on shd.")
+                return True
+
+        # Check for memory leaks on brick processes
+        if check_for_memory_leaks_in_glusterfsd(cls.servers, test_id, gain):
+            g.log.error("Memory leak on brick process.")
+            return True
+
+        # Check OOM kills on servers for all gluster server processes
+        if check_for_oom_killers_on_servers(cls.servers):
+            g.log.error('OOM kills present on servers.')
+            return True
+        return False
+
+    @classmethod
+    def check_for_memory_leaks_and_oom_kills_on_clients(cls, test_id, gain=30):
+        """Check for memory leaks and OOM kills on clients
+
+        Args:
+         test_id(str): ID of the test running fetched from self.id()
+
+        Kwargs:
+         gain(float): Accepted amount of leak for a given testcase in MB
+                      (Default:30)
+
+        Returns:
+         bool: True if memory leaks or OOM kills are observed else false
+        """
+        # imports are added inside function to make it them
+        # optional and not cause breakage on installation
+        # which don't use the resource leak library
+        from glustolibs.io.memory_and_cpu_utils import (
+            check_for_memory_leaks_in_glusterfs_fuse,
+            check_for_oom_killers_on_clients)
+
+        # Check for memory leak on glusterfs fuse process
+        if check_for_memory_leaks_in_glusterfs_fuse(cls.clients, test_id,
+                                                    gain):
+            g.log.error("Memory leaks observed on FUSE clients.")
+            return True
+
+        # Check for oom kills on clients
+        if check_for_oom_killers_on_clients(cls.clients):
+            g.log.error("OOM kills present on clients.")
+            return True
+        return False
+
+    @classmethod
+    def check_for_cpu_usage_spikes_on_servers(cls, test_id, threshold=3):
+        """Check for CPU usage spikes on servers
+
+        Args:
+         test_id(str): ID of the test running fetched from self.id()
+
+        Kwargs:
+         threshold(int): Accepted amount of instances of 100% CPU usage
+                        (Default:3)
+        Returns:
+         bool: True if CPU spikes are more than threshold else False
+        """
+        # imports are added inside function to make it them
+        # optional and not cause breakage on installation
+        # which don't use the resource leak library
+        from glustolibs.io.memory_and_cpu_utils import (
+            check_for_cpu_usage_spikes_on_glusterd,
+            check_for_cpu_usage_spikes_on_glusterfs,
+            check_for_cpu_usage_spikes_on_glusterfsd)
+
+        # Check for CPU usage spikes on glusterd
+        if check_for_cpu_usage_spikes_on_glusterd(cls.servers, test_id,
+                                                  threshold):
+            g.log.error("CPU usage spikes observed more than threshold "
+                        "on glusterd.")
+            return True
+
+        if cls.volume_type != "distributed":
+            # Check for CPU usage spikes on shd
+            if check_for_cpu_usage_spikes_on_glusterfs(cls.servers, test_id,
+                                                       threshold):
+                g.log.error("CPU usage spikes observed more than threshold "
+                            "on shd.")
+                return True
+
+        # Check for CPU usage spikes on brick processes
+        if check_for_cpu_usage_spikes_on_glusterfsd(cls.servers, test_id,
+                                                    threshold):
+            g.log.error("CPU usage spikes observed more than threshold "
+                        "on shd.")
+            return True
+        return False
+
+    @classmethod
+    def check_for_cpu_spikes_on_clients(cls, test_id, threshold=3):
+        """Check for CPU usage spikes on clients
+
+        Args:
+         test_id(str): ID of the test running fetched from self.id()
+
+        Kwargs:
+         threshold(int): Accepted amount of instances of 100% CPU usage
+                        (Default:3)
+        Returns:
+         bool: True if CPU spikes are more than threshold else False
+        """
+        # imports are added inside function to make it them
+        # optional and not cause breakage on installation
+        # which don't use the resource leak library
+        from glustolibs.io.memory_and_cpu_utils import (
+            check_for_cpu_usage_spikes_on_glusterfs_fuse)
+
+        ret = check_for_cpu_usage_spikes_on_glusterfs_fuse(cls.clients,
+                                                           test_id,
+                                                           threshold)
+        return ret

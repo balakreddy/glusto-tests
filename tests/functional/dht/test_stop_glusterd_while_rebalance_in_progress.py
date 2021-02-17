@@ -167,7 +167,7 @@ class RebalanceValidation(GlusterBaseClass):
         # Wait for rebalance to complete
         g.log.info("Waiting for rebalance to complete")
         ret = wait_for_rebalance_to_complete(self.mnode, self.volname,
-                                             timeout=600)
+                                             timeout=1800)
         self.assertTrue(ret, ("Rebalance is either timed out or failed"
                               "%s", self.volname))
         g.log.info("Volume %s: Rebalance completed successfully",
@@ -205,14 +205,12 @@ class RebalanceValidation(GlusterBaseClass):
         if not ret:
             raise ExecutionError("All peers are in connected state")
 
-    @classmethod
-    def tearDownClass(cls):
-        # Unmount Volume and Cleanup Volume
+        # Unmount and cleanup original volume
         g.log.info("Starting to Unmount Volume and Cleanup Volume")
-        ret = cls.unmount_volume_and_cleanup_volume(mounts=cls.mounts)
+        ret = self.unmount_volume_and_cleanup_volume(mounts=self.mounts)
         if not ret:
-            raise ExecutionError("Failed to Unmount Volume and Cleanup Volume")
-        g.log.info("Successful in Unmount Volume and Cleanup Volume")
+            raise ExecutionError("Failed to umount the vol & cleanup Volume")
+        g.log.info("Successful in umounting the volume and Cleanup")
 
         # Calling GlusterBaseClass tearDown
-        cls.get_super_method(cls, 'tearDownClass')()
+        self.get_super_method(self, 'tearDown')()

@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-#  Copyright (C) 2015-2020  Red Hat, Inc. <http://www.redhat.com>
+#  Copyright (C) 2015-2021  Red Hat, Inc. <http://www.redhat.com>
 #
 #  This program is free software; you can redistribute it and/or modify
 #  it under the terms of the GNU General Public License as published by
@@ -26,8 +26,6 @@ import re
 import time
 from collections import OrderedDict
 import tempfile
-import subprocess
-import random
 
 ONE_GB_BYTES = 1073741824.0
 
@@ -53,23 +51,16 @@ def append_string_to_file(mnode, filename, str_to_add_in_file,
     Returns:
         True, on success, False otherwise
     """
-    try:
-        conn = g.rpyc_get_connection(mnode, user=user)
-        if conn is None:
-            g.log.error("Unable to get connection to 'root' of node %s"
-                        " in append_string_to_file()" % mnode)
-            return False
-
-        with conn.builtin.open(filename, 'a') as _filehandle:
-            _filehandle.write(str_to_add_in_file)
-
-        return True
-    except IOError:
-        g.log.error("Exception occurred while adding string to "
-                    "file %s in append_string_to_file()", filename)
+    cmd = "echo '{0}' >> {1}".format(str_to_add_in_file,
+                                     filename)
+    ret, out, err = g.run(mnode, cmd, user)
+    if ret or out or err:
+        g.log.error("Unable to append string '{0}' to file "
+                    "'{1}' on node {2} using user {3}"
+                    .format(str_to_add_in_file, filename,
+                            mnode, user))
         return False
-    finally:
-        g.rpyc_close_connection(host=mnode, user=user)
+    return True
 
 
 def search_pattern_in_file(mnode, search_pattern, filename, start_str_to_parse,
@@ -268,31 +259,19 @@ def list_files(mnode, dir_path, parse_str="", user="root"):
         NoneType: None if command execution fails, parse errors.
         list: files with absolute name
     """
-
-    try:
-        conn = g.rpyc_get_connection(mnode, user=user)
-        if conn is None:
-            g.log.error("Unable to get connection to 'root' of node %s"
-                        % mnode)
-            return None
-
-        filepaths = []
-        for root, directories, files in conn.modules.os.walk(dir_path):
-            for filename in files:
-                if parse_str != "":
-                    if parse_str in filename:
-                        filepath = conn.modules.os.path.join(root, filename)
-                        filepaths.append(filepath)
-                else:
-                    filepath = conn.modules.os.path.join(root, filename)
-                    filepaths.append(filepath)
-        return filepaths
-    except StopIteration:
-        g.log.error("Exception occurred in list_files()")
+    if parse_str == "":
+        cmd = "find {0} -type f".format(dir_path)
+    else:
+        cmd = "find {0} -type f | grep {1}".format(dir_path,
+                                                   parse_str)
+    ret, out, err = g.run(mnode, cmd, user)
+    if ret or err:
+        g.log.error("Unable to get the list of files on path "
+                    "{0} on node {1} using user {2} due to error {3}"
+                    .format(dir_path, mnode, user, err))
         return None
-
-    finally:
-        g.rpyc_close_connection(host=mnode, user=user)
+    file_list = out.split('\n')
+    return file_list[0:len(file_list)-1]
 
 
 def get_servers_bricks_dict(servers, servers_info):
@@ -408,7 +387,8 @@ def get_servers_unused_bricks_dict(mnode, servers, servers_info):
     return servers_unused_bricks_dict
 
 
-def form_bricks_list(mnode, volname, number_of_bricks, servers, servers_info):
+def form_bricks_list(mnode, volname, number_of_bricks, servers, servers_info,
+                     dirname=None):
     """Forms bricks list for create-volume/add-brick given the num_of_bricks
         servers and servers_info.
 
@@ -420,6 +400,9 @@ def form_bricks_list(mnode, volname, number_of_bricks, servers, servers_info):
         servers (str|list): A server|List of servers from which the bricks
             needs to be selected for creating the brick list.
         servers_info (dict): dict of server info of each servers.
+
+    kwargs:
+        dirname (str): Name of the directory for glusterfs brick
 
     Returns:
         list - List of bricks to use with volume-create/add-brick
@@ -458,10 +441,18 @@ def form_bricks_list(mnode, volname, number_of_bricks, servers, servers_info):
             list(servers_unused_bricks_dict.values())[dict_index])
         brick_path = ''
         if current_server_unused_bricks_list:
-            brick_path = ("%s:%s/%s_brick%s" %
-                          (current_server,
-                           current_server_unused_bricks_list[0], volname, num))
-            bricks_list.append(brick_path)
+            if dirname and (" " not in dirname):
+                brick_path = ("%s:%s/%s_brick%s" %
+                              (current_server,
+                               current_server_unused_bricks_list[0], dirname,
+                               num))
+                bricks_list.append(brick_path)
+            else:
+                brick_path = ("%s:%s/%s_brick%s" %
+                              (current_server,
+                               current_server_unused_bricks_list[0], volname,
+                               num))
+                bricks_list.append(brick_path)
 
             # Remove the added brick from the current_server_unused_bricks_list
             list(servers_unused_bricks_dict.values())[dict_index].pop(0)
@@ -544,22 +535,13 @@ def get_disk_usage(mnode, path, user="root"):
     Example:
         get_disk_usage("abc.com", "/mnt/glusterfs")
     """
-
-    inst = random.randint(10, 100)
-    conn = g.rpyc_get_connection(mnode, user=user, instance=inst)
-    if conn is None:
-        g.log.error("Failed to get rpyc connection")
+    cmd = 'stat -f {0}'.format(path)
+    ret, out, err = g.run(mnode, cmd, user)
+    if ret:
+        g.log.error("Unable to get stat of path {0} on node {1} "
+                    "using user {2} due to error {3}".format(path, mnode,
+                                                             user, err))
         return None
-    cmd = 'stat -f ' + path
-    p = conn.modules.subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE,
-                                      stderr=subprocess.PIPE)
-    out, err = p.communicate()
-    ret = p.returncode
-    if ret != 0:
-        g.log.error("Failed to execute stat command")
-        return None
-
-    g.rpyc_close_connection(host=mnode, user=user, instance=inst)
     res = ''.join(out)
     match = re.match(r'.*Block size:\s(\d+).*Blocks:\sTotal:\s(\d+)\s+?'
                      r'Free:\s(\d+)\s+?Available:\s(\d+).*Inodes:\s'
@@ -1034,6 +1016,30 @@ def group_add(servers, groupname):
     return True
 
 
+def group_del(servers, groupname):
+    """
+    Deletes a group in all the servers.
+
+    Args:
+        servers(list|str): Nodes on which cmd is to be executed.
+        groupname(str): Name of the group to be removed.
+
+    Return always True
+    """
+    if not isinstance(servers, list):
+        servers = [servers]
+
+    cmd = "groupdel %s" % groupname
+    results = g.run_parallel(servers, cmd)
+
+    for server, ret_value in list(results.items()):
+        retcode, _, err = ret_value
+        if retcode != 0 and "does not exist" in err:
+            g.log.error("Group %s on server %s already removed",
+                        groupname, server)
+    return True
+
+
 def ssh_keygen(mnode):
     """
     Creates a pair of ssh private and public key if not present
@@ -1229,3 +1235,25 @@ def collect_bricks_arequal(bricks_list):
             arequal_list.append(arequal)
 
     return (return_code, arequal_list)
+
+
+def get_usable_size_per_disk(brickpath, min_free_limit=10):
+    """Get the usable size per disk
+
+    Args:
+     brickpath(str): Brick path to be used to calculate usable size
+
+    Kwargs:
+     min_free_limit(int): Min free disk limit to be used
+
+    Returns:
+      (int): Usable size in GB. None in case of errors.
+    """
+    node, brick_path = brickpath.split(':')
+    size = get_size_of_mountpoint(node, brick_path)
+    if not size:
+        return None
+    size = int(size)
+    min_free_size = size * min_free_limit // 100
+    usable_size = ((size - min_free_size) // 1048576) + 1
+    return usable_size

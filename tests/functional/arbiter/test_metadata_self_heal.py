@@ -207,10 +207,7 @@ class TestMetadataSelfHeal(GlusterBaseClass):
         # Select bricks to bring offline
         bricks_to_bring_offline_dict = (select_bricks_to_bring_offline(
             self.mnode, self.volname))
-        bricks_to_bring_offline = list(filter(None, (
-            bricks_to_bring_offline_dict['hot_tier_bricks'] +
-            bricks_to_bring_offline_dict['cold_tier_bricks'] +
-            bricks_to_bring_offline_dict['volume_bricks'])))
+        bricks_to_bring_offline = bricks_to_bring_offline_dict['volume_bricks']
 
         # Bring brick offline
         g.log.info('Bringing bricks %s offline...', bricks_to_bring_offline)
@@ -332,8 +329,9 @@ class TestMetadataSelfHeal(GlusterBaseClass):
 
         # Checking arequals before bringing bricks online
         # and after bringing bricks online
-        self.assertItemsEqual(result_before_online, result_after_online,
-                              'Checksums are not equal')
+        self.assertEqual(sorted(result_before_online),
+                         sorted(result_after_online),
+                         'Checksums are not equal')
         g.log.info('Checksums before bringing bricks online '
                    'and after bringing bricks online are equal')
 
@@ -356,11 +354,6 @@ class TestMetadataSelfHeal(GlusterBaseClass):
             ret, out, err = g.run(node, command)
             file_list = out.split()
 
-            g.log.info('Checking for user and group on %s...', node)
-            conn = g.rpyc_get_connection(node)
-            if conn is None:
-                raise Exception("Unable to get connection on node %s" % node)
-
             for file_name in file_list:
                 file_to_check = '%s/%s/%s' % (nodes_to_check[node],
                                               test_meta_data_self_heal_folder,
@@ -368,26 +361,30 @@ class TestMetadataSelfHeal(GlusterBaseClass):
 
                 g.log.info('Checking for permissions, user and group for %s',
                            file_name)
+
                 # Check for permissions
-                permissions = oct(
-                    conn.modules.os.stat(file_to_check).st_mode)[-3:]
-                self.assertEqual(permissions, '444',
+                cmd = ("stat -c '%a %n' {} | awk '{{print $1}}'"
+                       .format(file_to_check))
+                ret, permissions, _ = g.run(node, cmd)
+                self.assertEqual(permissions.split('\n')[0], '444',
                                  'Permissions %s is not equal to 444'
                                  % permissions)
                 g.log.info("Permissions are '444' for %s", file_name)
 
                 # Check for user
-                uid = conn.modules.os.stat(file_to_check).st_uid
-                username = conn.modules.pwd.getpwuid(uid).pw_name
-                self.assertEqual(username, 'qa', 'User %s is not equal qa'
+                cmd = ("ls -ld {} | awk '{{print $3}}'"
+                       .format(file_to_check))
+                ret, username, _ = g.run(node, cmd)
+                self.assertEqual(username.split('\n')[0],
+                                 'qa', 'User %s is not equal qa'
                                  % username)
                 g.log.info("User is 'qa' for %s", file_name)
 
                 # Check for group
-                gid = conn.modules.os.stat(file_to_check).st_gid
-                groupname = conn.modules.grp.getgrgid(gid).gr_name
-                self.assertEqual(groupname, 'qa', 'Group %s is not equal qa'
+                cmd = ("ls -ld {} | awk '{{print $4}}'"
+                       .format(file_to_check))
+                ret, groupname, _ = g.run(node, cmd)
+                self.assertEqual(groupname.split('\n')[0],
+                                 'qa', 'Group %s is not equal qa'
                                  % groupname)
                 g.log.info("Group is 'qa' for %s", file_name)
-
-            g.rpyc_close_connection(host=node)

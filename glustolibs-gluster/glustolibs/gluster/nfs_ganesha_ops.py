@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-#  Copyright (C) 2016-2017  Red Hat, Inc. <http://www.redhat.com>
+#  Copyright (C) 2016-2021 Red Hat, Inc. <http://www.redhat.com>
 #
 #  This program is free software; you can redistribute it and/or modify
 #  it under the terms of the GNU General Public License as published by
@@ -23,10 +23,10 @@
 """
 
 import os
-import random
 from glusto.core import Glusto as g
 from glustolibs.gluster.glusterdir import mkdir
-from glustolibs.gluster.lib_utils import add_services_to_firewall
+from glustolibs.gluster.lib_utils import (add_services_to_firewall,
+                                          is_rhel7)
 from glustolibs.gluster.shared_storage_ops import enable_shared_storage
 from glustolibs.gluster.peer_ops import peer_probe_servers
 
@@ -50,17 +50,33 @@ def teardown_nfs_ganesha_cluster(servers, force=False):
     Example:
         teardown_nfs_ganesha_cluster(servers)
     """
+    # Copy ganesha.conf before proceeding to clean up
+    for server in servers:
+        cmd = "cp /etc/ganesha/ganesha.conf ganesha.conf"
+        ret, _, _ = g.run(server, cmd)
+        if ret:
+            g.log.error("Failed to copy ganesha.conf")
+
     if force:
         g.log.info("Executing force cleanup...")
+        cleanup_ops = ['--teardown', '--cleanup']
         for server in servers:
-            cmd = ("/usr/libexec/ganesha/ganesha-ha.sh --teardown "
-                   "/var/run/gluster/shared_storage/nfs-ganesha")
-            _, _, _ = g.run(server, cmd)
-            cmd = ("/usr/libexec/ganesha/ganesha-ha.sh --cleanup /var/run/"
-                   "gluster/shared_storage/nfs-ganesha")
-            _, _, _ = g.run(server, cmd)
+            # Perform teardown and cleanup
+            for op in cleanup_ops:
+                cmd = ("/usr/libexec/ganesha/ganesha-ha.sh {} /var/run/"
+                       "gluster/shared_storage/nfs-ganesha".format(op))
+                _, _, _ = g.run(server, cmd)
+
+            # Stop nfs ganesha service
             _, _, _ = stop_nfs_ganesha_service(server)
+
+            # Clean shared storage, ganesha.conf, and replace with backup
+            for cmd in ("rm -rf /var/run/gluster/shared_storage/*",
+                        "rm -rf /etc/ganesha/ganesha.conf",
+                        "cp ganesha.conf /etc/ganesha/ganesha.conf"):
+                _, _, _ = g.run(server, cmd)
         return True
+
     ret, _, _ = disable_nfs_ganesha(servers[0])
     if ret != 0:
         g.log.error("Nfs-ganesha disable failed")
@@ -667,14 +683,17 @@ def create_nfs_ganesha_cluster(servers, vips):
         False(bool): If failed to configure ganesha cluster
     """
     # pylint: disable=too-many-return-statements
+    # pylint: disable=too-many-branches
+    # pylint: disable=too-many-statements
     ganesha_mnode = servers[0]
 
-    # Configure ports in ganesha servers
-    g.log.info("Defining statd service ports")
-    ret = configure_ports_on_servers(servers)
-    if not ret:
-        g.log.error("Failed to set statd service ports on nodes.")
-        return False
+    # Configure ports in ganesha servers for RHEL7
+    if is_rhel7(servers):
+        g.log.info("Defining statd service ports")
+        ret = configure_ports_on_servers(servers)
+        if not ret:
+            g.log.error("Failed to set statd service ports on nodes.")
+            return False
 
     # Firewall settings for nfs-ganesha
     ret = ganesha_server_firewall_settings(servers)
@@ -752,6 +771,22 @@ def create_nfs_ganesha_cluster(servers, vips):
     # Create backup of ganesha-ha.conf file in ganesha_mnode
     g.upload(ganesha_mnode, tmp_ha_conf, '/etc/ganesha/')
 
+    # setsebool ganesha_use_fusefs on
+    cmd = "setsebool ganesha_use_fusefs on"
+    for server in servers:
+        ret, _, _ = g.run(server, cmd)
+        if ret:
+            g.log.error("Failed to 'setsebool ganesha_use_fusefs on' on %",
+                        server)
+            return False
+
+        # Verify ganesha_use_fusefs is on
+        _, out, _ = g.run(server, "getsebool ganesha_use_fusefs")
+        if "ganesha_use_fusefs --> on" not in out:
+            g.log.error("Failed to 'setsebool ganesha_use_fusefs on' on %",
+                        server)
+            return False
+
     # Enabling ganesha
     g.log.info("Enable nfs-ganesha")
     ret, _, _ = enable_nfs_ganesha(ganesha_mnode)
@@ -765,6 +800,31 @@ def create_nfs_ganesha_cluster(servers, vips):
     # pcs status output
     _, _, _ = g.run(ganesha_mnode, "pcs status")
 
+    # pacemaker status output
+    _, _, _ = g.run(ganesha_mnode, "systemctl status pacemaker")
+
+    return True
+
+
+def enable_firewall(servers):
+    """Enables Firewall if not enabled already
+    Args:
+        servers(list): Hostname of ganesha nodes
+    Returns:
+        Status (bool) : True/False based on the status of firewall enable
+    """
+
+    cmd = "systemctl status firewalld | grep Active"
+    for server in servers:
+        ret, out, _ = g.run(server, cmd)
+        if 'inactive' in out:
+            g.log.info("Firewalld is not running. Enabling Firewalld")
+            for command in ("enable", "start"):
+                ret, out, _ = g.run(server,
+                                    "systemctl {} firewalld".format(command))
+                if ret:
+                    g.log.error("Failed to enable Firewalld on %s", server)
+                    return False
     return True
 
 
@@ -778,9 +838,11 @@ def ganesha_server_firewall_settings(servers):
         True(bool): If successfully set the firewall settings
         False(bool): If failed to do firewall settings
     """
+    if not enable_firewall(servers):
+        return False
+
     services = ['nfs', 'rpc-bind', 'high-availability', 'nlm', 'mountd',
                 'rquota']
-
     ret = add_services_to_firewall(servers, services, True)
     if not ret:
         g.log.error("Failed to set firewall zone permanently on ganesha nodes")
@@ -852,47 +914,51 @@ def create_nfs_passwordless_ssh(mnode, gnodes, guser='root'):
         False(bool): On failure
     """
     loc = "/var/lib/glusterd/nfs/"
-    mconn_inst = random.randint(20, 100)
-    mconn = g.rpyc_get_connection(host=mnode, instance=mconn_inst)
 
-    if not mconn.modules.os.path.isfile('/root/.ssh/id_rsa'):
+    # Check whether key is present
+    cmd = "[ -f /root/.ssh/id_rsa ]"
+    ret, _, _ = g.run(mnode, cmd)
+    if ret:
         # Generate key on mnode if not already present
-        if not mconn.modules.os.path.isfile('%s/secret.pem' % loc):
+        g.log.info("id_rsa not found")
+        cmd = "[ -f %s/secret.pem ]" % loc
+        ret, _, _ = g.run(mnode, cmd)
+        if ret:
+            g.log.info("Secret.pem file not found. Creating new")
             ret, _, _ = g.run(
                 mnode, "ssh-keygen -f %s/secret.pem -q -N ''" % loc)
-            if ret != 0:
+            if ret:
                 g.log.error("Failed to generate the secret pem file")
                 return False
             g.log.info("Key generated on %s" % mnode)
     else:
-        mconn.modules.shutil.copyfile("/root/.ssh/id_rsa",
-                                      "%s/secret.pem" % loc)
-        g.log.info("Copying the id_rsa.pub to secret.pem.pub")
-        mconn.modules.shutil.copyfile("/root/.ssh/id_rsa.pub",
-                                      "%s/secret.pem.pub" % loc)
+        g.log.info("Found existing key")
+        # Copy the .pem and .pyb files
+        for file, to_file in (('id_rsa', 'secret.pem'), ('id_rsa.pub',
+                                                         'secret.pem.pub')):
+            cmd = "cp /root/.ssh/{}  {}{}".format(file, loc, to_file)
+            ret, _, err = g.run(mnode, cmd)
+            if ret:
+                g.log.error("Failed to copy {} to {} file {}".format(file,
+                                                                     to_file,
+                                                                     err))
+                return False
 
     # Create password less ssh from mnode to all ganesha nodes
+    cmd = "cat /root/.ssh/id_rsa.pub"
+    ret, id_rsa, _ = g.run(mnode, cmd, user=guser)
+    if ret:
+        g.log.info("Failed to read key from %s", mnode)
+        return False
     for gnode in gnodes:
-        gconn_inst = random.randint(20, 100)
-        gconn = g.rpyc_get_connection(gnode, user=guser, instance=gconn_inst)
-        try:
-            glocal = gconn.modules.os.path.expanduser('~')
-            gfhand = gconn.builtin.open("%s/.ssh/authorized_keys" % glocal,
-                                        "a")
-            with mconn.builtin.open("/root/.ssh/id_rsa.pub", 'r') as fhand:
-                for line in fhand:
-                    gfhand.write(line)
-            gfhand.close()
-        except Exception as exep:
-            g.log.error("Exception occurred while trying to establish "
-                        "password less ssh from %s@%s to %s@%s. Exception: %s"
-                        % ('root', mnode, guser, gnode, exep))
+        file = "~/.ssh/authorized_keys"
+        cmd = ("grep -q '{}' {} || echo '{}' >> {}"
+               .format(id_rsa.rstrip(), file, id_rsa.rstrip(), file))
+        ret, _, _ = g.run(gnode, cmd, user=guser)
+        if ret:
+            g.log.info("Failed to add ssh key for %s", gnode)
             return False
-        finally:
-            g.rpyc_close_connection(
-                host=gnode, user=guser, instance=gconn_inst)
-
-    g.rpyc_close_connection(host=mnode, instance=mconn_inst)
+    g.log.info("Successfully copied ssh key to all Ganesha nodes")
 
     # Copy the ssh key pair from mnode to all the nodes in the Ganesha-HA
     # cluster
@@ -906,8 +972,8 @@ def create_nfs_passwordless_ssh(mnode, gnodes, guser='root'):
                    % (loc, loc, guser, gnode, loc))
             ret, _, _ = g.run(mnode, cmd)
             if ret != 0:
-                g.log.error("Failed to copy the ssh key pair from %s to %s",
-                            mnode, gnode)
+                g.log.error("Failed to copy the ssh key pair from "
+                            "%s to %s", mnode, gnode)
                 return False
     return True
 
@@ -923,7 +989,7 @@ def create_ganesha_ha_conf(hostnames, vips, temp_ha_file):
     """
     hosts = ','.join(hostnames)
 
-    with open(temp_ha_file, 'wb') as fhand:
+    with open(temp_ha_file, 'w') as fhand:
         fhand.write('HA_NAME="ganesha-ha-360"\n')
         fhand.write('HA_CLUSTER_NODES="%s"\n' % hosts)
         for (hostname, vip) in zip(hostnames, vips):
@@ -940,7 +1006,6 @@ def cluster_auth_setup(servers):
         True(bool): If configuration of cluster services is success
         False(bool): If failed to configure cluster services
     """
-    result = True
     for node in servers:
         # Enable pacemaker.service
         ret, _, _ = g.run(node, "systemctl enable pacemaker.service")
@@ -965,13 +1030,15 @@ def cluster_auth_setup(servers):
             return False
 
     # Perform cluster authentication between the nodes
+    auth_type = 'cluster' if is_rhel7(servers) else 'host'
     for node in servers:
-        ret, _, _ = g.run(node, "pcs cluster auth %s -u hacluster -p "
-                                "hacluster" % ' '.join(servers))
-        if ret != 0:
-            g.log.error("pcs cluster auth command failed on %s", node)
-            result = False
-    return result
+        ret, _, _ = g.run(node, "pcs %s auth %s -u hacluster -p hacluster"
+                          % (auth_type, ' '.join(servers)))
+        if ret:
+            g.log.error("pcs %s auth command failed on %s",
+                        auth_type, node)
+            return False
+    return True
 
 
 def configure_ports_on_servers(servers):

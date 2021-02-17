@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-#  Copyright (C) 2017-2019  Red Hat, Inc. <http://www.redhat.com>
+#  Copyright (C) 2017-2020 Red Hat, Inc. <http://www.redhat.com>
 #
 #  This program is free software; you can redistribute it and/or modify
 #  it under the terms of the GNU General Public License as published by
@@ -119,7 +119,7 @@ def check_brick_pid_matches_glusterfsd_pid(mnode, volname):
                         "of brick path %s", brick_node, brick_path)
             _rc = False
 
-        cmd = "pidof glusterfsd"
+        cmd = "pgrep -x glusterfsd"
         ret, pid, _ = g.run(brick_node, cmd)
         if ret != 0:
             g.log.error("Failed to run the command %s on "
@@ -127,7 +127,7 @@ def check_brick_pid_matches_glusterfsd_pid(mnode, volname):
             _rc = False
 
         else:
-            glusterfsd_pid = pid.split()
+            glusterfsd_pid = pid.split('\n')[:-1]
 
         if brick_pid not in glusterfsd_pid:
             g.log.error("Brick pid %s doesn't match glusterfsd "
@@ -149,8 +149,10 @@ def get_brick_processes_count(mnode):
         int: Number of brick processes running on the node.
         None: If the command fails to execute.
     """
-    ret, out, _ = g.run(mnode, "pidof glusterfsd")
+    ret, out, _ = g.run(mnode, "pgrep -x glusterfsd")
     if not ret:
-        return len(out.split(" "))
+        list_of_pids = out.split("\n")
+        list_of_pids.pop()
+        return len(list_of_pids)
     else:
         return None

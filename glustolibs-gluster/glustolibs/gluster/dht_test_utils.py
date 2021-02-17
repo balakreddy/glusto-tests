@@ -22,14 +22,14 @@ import os
 from glusto.core import Glusto as g
 
 from glustolibs.gluster.glusterfile import (GlusterFile, calculate_hash,
-                                            get_pathinfo)
+                                            get_pathinfo, file_exists)
 from glustolibs.gluster.glusterdir import GlusterDir
 from glustolibs.gluster.layout import Layout
 import glustolibs.gluster.constants as k
 import glustolibs.gluster.exceptions as gex
 from glustolibs.gluster.brickdir import BrickDir
 from glustolibs.gluster.volume_libs import get_subvols, get_volume_type
-from glustolibs.gluster.gluster_init import get_gluster_version
+from glustolibs.misc.misc_libs import upload_scripts
 
 
 def run_layout_tests(mnode, fqpath, layout, test_type):
@@ -38,9 +38,8 @@ def run_layout_tests(mnode, fqpath, layout, test_type):
     brick_path_list = ret.get('brickdir_paths')
     for brickdir_path in brick_path_list:
         (server_ip, _) = brickdir_path.split(':')
-        if (get_gluster_version(server_ip) >= 6.0 and
-                get_volume_type(brickdir_path) in ('Replicate', 'Disperse',
-                                                   'Arbiter')):
+        if get_volume_type(brickdir_path) in ('Replicate', 'Disperse',
+                                              'Arbiter'):
             g.log.info("Cannot check for layout completeness as"
                        " volume under test is Replicate/Disperse/Arbiter")
         else:
@@ -120,11 +119,25 @@ def validate_files_in_dir(mnode, rootdir,
     """
     layout_cache = {}
 
-    conn = g.rpyc_get_connection(mnode)
-    if conn is None:
-        g.log.info("Not able to establish connection to node %s" % mnode)
+    script_path = ("/usr/share/glustolibs/scripts/walk_dir.py")
+    if not file_exists(mnode, script_path):
+        if upload_scripts(mnode, script_path,
+                          "/usr/share/glustolibs/scripts/"):
+            g.log.info("Successfully uploaded script "
+                       "walk_dir.py!")
+        else:
+            g.log.error("Faild to upload walk_dir.py!")
+            return False
+    else:
+        g.log.info("compute_hash.py already present!")
+
+    cmd = ("/usr/bin/env python {0} {1}".format(script_path, rootdir))
+    ret, out, _ = g.run(mnode, cmd)
+    if ret:
+        g.log.error('Unable to run the script on node {0}'
+                    .format(mnode))
         return False
-    for walkies in conn.modules.os.walk(rootdir):
+    for walkies in eval(out):
         g.log.info("TESTING DIRECTORY %s..." % walkies[0])
 
         # check directories
@@ -161,8 +174,6 @@ def validate_files_in_dir(mnode, rootdir,
 
                 if test_type & k.TEST_FILE_EXISTS_ON_HASHED_BRICKS:
                     run_hashed_bricks_test(gfile)
-
-    g.rpyc_close_connection(mnode)
     return True
 
 
@@ -297,10 +308,21 @@ def find_new_hashed(subvols, parent_path, oldname):
         g.log.error("could not form brickobject list")
         return None
 
+    for bro in brickobject:
+        bro._get_hashrange()
+        low = bro._hashrange_low
+        high = bro._hashrange_high
+        g.log.debug("low hashrange %s high hashrange %s", str(low), str(high))
+        g.log.debug("absoulte path %s", bro._fqpath)
+
+    hash_num = calculate_hash(brickobject[0]._host, oldname)
     oldhashed, _ = find_hashed_subvol(subvols, parent_path, oldname)
     if oldhashed is None:
         g.log.error("could not find old hashed subvol")
         return None
+
+    g.log.debug("oldhashed: %s oldname: %s oldhash %s", oldhashed._host,
+                oldname, hash_num)
 
     count = -1
     for item in range(1, 5000, 1):
@@ -309,11 +331,49 @@ def find_new_hashed(subvols, parent_path, oldname):
             count += 1
             ret = brickdir.hashrange_contains_hash(newhash)
             if ret == 1:
-                if oldhashed._host != brickdir._host:
+                if oldhashed._fqpath != brickdir._fqpath:
                     g.log.debug("oldhashed %s new %s count %s",
                                 oldhashed, brickdir._host, str(count))
                     return NewHashed(item, brickdir, count)
 
+        count = -1
+    return None
+
+
+def find_specific_hashed(subvols, parent_path, subvol, existing_names=None):
+    """ Finds filename that hashes to a specific subvol.
+
+    Args:
+           subvols(list): list of subvols
+           parent_path(str): parent path (relative to mount) of "oldname"
+           subvol(str): The subvol to which the new name has to be hashed
+           existing_names(int|list): The name(s) already hashed to subvol
+
+    Returns:
+             (Class Object): For success returns an object of type NewHashed
+                            holding information pertaining to new name.
+                            None, otherwise
+     Note: The new hash will be searched under the same parent
+    """
+    # pylint: disable=protected-access
+    if not isinstance(existing_names, list):
+        existing_names = [existing_names]
+    brickobject = create_brickobjectlist(subvols, parent_path)
+    if brickobject is None:
+        g.log.error("could not form brickobject list")
+        return None
+    count = -1
+    for item in range(1, 5000, 1):
+        newhash = calculate_hash(brickobject[0]._host, str(item))
+        for brickdir in brickobject:
+            count += 1
+            if (subvol._fqpath == brickdir._fqpath and
+                    item not in existing_names):
+                ret = brickdir.hashrange_contains_hash(newhash)
+                if ret:
+                    g.log.debug("oldhashed %s new %s count %s",
+                                subvol, brickdir._host, str(count))
+                    return NewHashed(item, brickdir, count)
         count = -1
     return None
 
@@ -396,3 +456,5 @@ def is_layout_complete(mnode, volname, dirpath):
             return False
         elif hash_difference < 1:
             g.log.error("Layout has overlaps")
+
+    return True

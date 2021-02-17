@@ -21,7 +21,7 @@ import sys
 import time
 
 from glusto.core import Glusto as g
-from glustolibs.gluster.lib_utils import is_rhel7
+from glustolibs.gluster.lib_utils import is_rhel6, is_rhel7
 
 
 def create_dirs(list_of_nodes, list_of_dir_paths):
@@ -341,8 +341,8 @@ def install_arequal(list_of_nodes):
         list_of_nodes = [list_of_nodes]
 
     try:
-        arequal_repo = (g.config['dependencies']['testing_tools']['arequal']
-                        ['repo'])
+        arequal_repo = (g.config['dependencies']['testing_tools']
+                        ['arequal']['repo'])
     except KeyError:
         arequal_repo = ("https://copr.fedorainfracloud.org/coprs/nigelbabu/"
                         "arequal/repo/epel-7/nigelbabu-arequal-epel-7.repo")
@@ -572,14 +572,14 @@ def daemon_reload(node):
         bool: True, On successful daemon reload
                False, Otherwise
     """
-    if is_rhel7([node]):
-        cmd = "systemctl daemon-reload"
+    if is_rhel6([node]):
+        cmd = 'service glusterd reload'
         ret, _, _ = g.run(node, cmd)
         if ret != 0:
             g.log.error("Failed to reload the daemon")
             return False
     else:
-        cmd = 'service glusterd reload'
+        cmd = "systemctl daemon-reload"
         ret, _, _ = g.run(node, cmd)
         if ret != 0:
             g.log.error("Failed to reload the daemon")
@@ -619,3 +619,72 @@ def git_clone_and_compile(hosts, link, dir_name, compile_option='False'):
         else:
             g.log.info("Successfully cloned/compiled repo on %s" % host)
     return True
+
+
+def kill_process(mnode, process_ids='', process_names=''):
+    """Kills the given set of process running in the specified node
+
+    Args:
+        mnode (str): Node at which the command has to be executed
+        process_ids (list|str): List of pid's to be terminated
+        process_names(list|str): List of Process names to be terminated
+
+    Returns:
+        bool : True on successful termination of all the processes
+               False, otherwise
+    Example:
+        >>> kill_process("10.70.43.68", process_ids=27664)
+        True/False
+        >>> kill_process("10.70.43.68", process_names=["glustershd",
+        "glusterd"])
+        True/False
+    """
+    if process_names:
+        process_ids = []
+        if not isinstance(process_names, list):
+            process_names = [process_names]
+
+        for process in process_names:
+            ret, pids, _ = g.run(mnode,
+                                 "ps -aef | grep -i '%s' | grep -v 'grep' | "
+                                 "awk '{ print $2 }'" % process)
+            pids = pids.split("\n")[:-1]
+            if not pids:
+                g.log.error("Getting pid for process %s failed" % process)
+                return False
+            for pid in pids:
+                if pid:
+                    process_ids.append(pid)
+
+    if process_ids and not isinstance(process_ids, list):
+        process_ids = [process_ids]
+
+    # Kill process
+    for pid in process_ids:
+        ret, _, _ = g.run(mnode, "kill -9 %s" % str(pid))
+        if ret:
+            g.log.error("Failed to kill process with pid %s" % str(pid))
+            return False
+    return True
+
+
+def bring_down_network_interface(mnode, timeout=150):
+    """Brings the network interface down for a defined time
+
+        Args:
+            mnode (str): Node at which the interface has to be bought down
+            timeout (int): Time duration (in secs) for which network has to
+                           be down
+
+        Returns:
+            network_status(object): Returns a process object
+
+        Example:
+            >>> bring_down_network_interface("10.70.43.68", timout=100)
+    """
+    interface = "eth0" if is_rhel7(mnode) else "ens3"
+    cmd = "ifconfig {0} down\nsleep {1}\nifconfig {0} up".format(interface,
+                                                                 timeout)
+    _, _, _ = g.run(mnode, "echo  \"{}\"> 'test.sh'".format(cmd))
+    network_status = g.run_async(mnode, "sh test.sh")
+    return network_status
